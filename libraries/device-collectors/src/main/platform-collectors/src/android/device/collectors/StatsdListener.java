@@ -21,7 +21,9 @@ import android.content.Context;
 import android.content.res.AssetManager;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.SystemClock;
 import android.util.Log;
+import android.util.StatsLog;
 import androidx.annotation.VisibleForTesting;
 import androidx.test.InstrumentationRegistry;
 
@@ -43,6 +45,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -64,11 +67,19 @@ public class StatsdListener extends BaseMetricListener {
     static final String REPORT_PATH_RUN_LEVEL = "run-level";
     // Sub-directory for test-level reports.
     static final String REPORT_PATH_TEST_LEVEL = "test-level";
-    // Prefix template for test-level metric report files.
-    static final String TEST_PREFIX_TEMPLATE = "%s-%d_";
+    // Suffix template for test-level metric report files.
+    static final String TEST_SUFFIX_TEMPLATE = "_%s-%d";
 
     // Common prefix for the metric key pointing to the report path.
     static final String REPORT_KEY_PREFIX = "statsd-";
+    // Common prefix for the metric file.
+    static final String REPORT_FILENAME_PREFIX = "statsd-";
+
+    // Labels used to signify test events to statsd with the AppBreadcrumbReported atom.
+    static final int RUN_EVENT_LABEL = 7;
+    static final int TEST_EVENT_LABEL = 11;
+    // A short delay after pushing the AppBreadcrumbReported event so that metrics can be dumped.
+    static final long METRIC_PULL_DELAY = TimeUnit.SECONDS.toMillis(1);
 
     // Configs used for the test run and each test, respectively.
     private Map<String, StatsdConfig> mRunLevelConfigs = new HashMap<String, StatsdConfig>();
@@ -93,6 +104,10 @@ public class StatsdListener extends BaseMetricListener {
         mTestLevelConfigs.putAll(getConfigsFromOption(OPTION_CONFIGS_TEST_LEVEL));
 
         mRunLevelConfigIds = registerConfigsWithStatsManager(mRunLevelConfigs);
+
+        if (!logStart(RUN_EVENT_LABEL)) {
+            Log.w(LOG_TAG, "Failed to log a test run start event. Metrics might be incomplete.");
+        }
     }
 
     /**
@@ -102,6 +117,11 @@ public class StatsdListener extends BaseMetricListener {
      */
     @Override
     public void onTestRunEnd(DataRecord runData, Result result) {
+        if (!logStop(RUN_EVENT_LABEL)) {
+            Log.w(LOG_TAG, "Failed to log a test run end event. Metrics might be incomplete.");
+        }
+        SystemClock.sleep(METRIC_PULL_DELAY);
+
         Map<String, File> configReports =
                 pullReportsAndRemoveConfigs(
                         mRunLevelConfigIds, Paths.get(REPORT_PATH_ROOT, REPORT_PATH_RUN_LEVEL), "");
@@ -116,6 +136,10 @@ public class StatsdListener extends BaseMetricListener {
         mTestIterations.computeIfPresent(description.getDisplayName(), (name, count) -> count + 1);
         mTestIterations.computeIfAbsent(description.getDisplayName(), name -> 1);
         mTestLevelConfigIds = registerConfigsWithStatsManager(mTestLevelConfigs);
+
+        if (!logStart(TEST_EVENT_LABEL)) {
+            Log.w(LOG_TAG, "Failed to log a test start event. Metrics might be incomplete.");
+        }
     }
 
     /**
@@ -125,11 +149,16 @@ public class StatsdListener extends BaseMetricListener {
      */
     @Override
     public void onTestEnd(DataRecord testData, Description description) {
+        if (!logStop(TEST_EVENT_LABEL)) {
+            Log.w(LOG_TAG, "Failed to log a test end event. Metrics might be incomplete.");
+        }
+        SystemClock.sleep(METRIC_PULL_DELAY);
+
         Map<String, File> configReports =
                 pullReportsAndRemoveConfigs(
                         mTestLevelConfigIds,
                         Paths.get(REPORT_PATH_ROOT, REPORT_PATH_TEST_LEVEL),
-                        getTestPrefix(description));
+                        getTestSuffix(description));
         for (String configName : configReports.keySet()) {
             testData.addFileMetric(REPORT_KEY_PREFIX + configName, configReports.get(configName));
         }
@@ -171,12 +200,12 @@ public class StatsdListener extends BaseMetricListener {
      * @param configIds Map of (config name, config Id)
      * @param directory relative directory on external storage to dump the report in. Each report
      *     will be named after its config.
-     * @param prefix a prefix to prepend to the metric report file name, used to differentiate
+     * @param suffix a suffix to append to the metric report file name, used to differentiate
      *     between tests and left empty for the test run.
      * @return Map of (config name, config report file)
      */
     private Map<String, File> pullReportsAndRemoveConfigs(
-            final Map<String, Long> configIds, Path directory, String prefix) {
+            final Map<String, Long> configIds, Path directory, String suffix) {
         File externalStorage = Environment.getExternalStorageDirectory();
         File saveDirectory = new File(externalStorage, directory.toString());
         if (!saveDirectory.isDirectory()) {
@@ -191,7 +220,10 @@ public class StatsdListener extends BaseMetricListener {
                 reportList =
                         ConfigMetricsReportList.parseFrom(
                                 getStatsReports(configIds.get(configName)));
-                File reportFile = new File(saveDirectory, prefix + configName + PROTO_EXTENSION);
+                File reportFile =
+                        new File(
+                                saveDirectory,
+                                REPORT_FILENAME_PREFIX + configName + suffix + PROTO_EXTENSION);
                 writeToFile(reportFile, reportList.toByteArray());
                 savedConfigFiles.put(configName, reportFile);
             } catch (StatsUnavailableException e) {
@@ -264,11 +296,11 @@ public class StatsdListener extends BaseMetricListener {
         return mStatsManager;
     }
 
-    /** Get the prefix for a test + iteration combination to differentiate it from other files. */
+    /** Get the suffix for a test + iteration combination to differentiate it from other files. */
     @VisibleForTesting
-    String getTestPrefix(Description description) {
+    String getTestSuffix(Description description) {
         return String.format(
-                TEST_PREFIX_TEMPLATE,
+                TEST_SUFFIX_TEMPLATE,
                 formatDescription(description),
                 mTestIterations.get(description.getDisplayName()));
     }
@@ -276,8 +308,11 @@ public class StatsdListener extends BaseMetricListener {
     /** Format a JUnit {@link Description} to a desired string format. */
     @VisibleForTesting
     String formatDescription(Description description) {
-        return String.join(
-                "#", description.getTestClass().getCanonicalName(), description.getMethodName());
+        // Use String.valueOf() to guard agaist a null class name. This normally should not happen
+        // but the Description class does not explicitly guarantee it.
+        String className = String.valueOf(description.getClassName());
+        String methodName = description.getMethodName();
+        return methodName == null ? className : String.join("#", className, methodName);
     }
 
     /**
@@ -402,5 +437,25 @@ public class StatsdListener extends BaseMetricListener {
                                 Function.identity(),
                                 configName ->
                                         parseConfigFromName(manager, optionName, configName)));
+    }
+
+    /**
+     * Log a "start" AppBreadcrumbReported event to statsd. Wraps a static method for testing.
+     *
+     * @hide
+     */
+    @VisibleForTesting
+    protected boolean logStart(int label) {
+        return StatsLog.logStart(label);
+    }
+
+    /**
+     * Log a "stop" AppBreadcrumbReported event to statsd. Wraps a static method for testing.
+     *
+     * @hide
+     */
+    @VisibleForTesting
+    protected boolean logStop(int label) {
+        return StatsLog.logStop(label);
     }
 }
